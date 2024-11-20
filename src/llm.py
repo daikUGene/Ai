@@ -3,7 +3,7 @@ import os
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 class LLM:
-    def __init__(self, model_name='gemini-1.5-flash', temperature=0.7):
+    def __init__(self, model_name='gemini-1.5-flash-8b', temperature=0.7):
         # APIキーの設定
         GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
         genai.configure(api_key=GOOGLE_API_KEY)
