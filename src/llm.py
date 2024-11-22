@@ -23,19 +23,16 @@ class LLM:
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
 
+        # チャットの初期化
+        self.chat = self.model.start_chat(history=[])
+
     def generate(self, prompt):
         # テキスト生成
-        response = self.model.generate_content(
-            prompt,  
-            # generation_config=self.generation_config,
-            safety_settings=self.safety_settings,
-        )
-        try:
-            print(response.text)
-        except ValueError:
-            print(response.prompt_feedback)
+        response = self.chat.send_message(prompt, stream=True)
 
-        return response.text
+        for chunk in response:
+            # print(chunk.text)
+            yield chunk.text
 
 if __name__ == "__main__":
     llm = LLM()
