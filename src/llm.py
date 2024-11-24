@@ -3,7 +3,7 @@ import os
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 class LLM:
-    def __init__(self, model_name='gemini-1.5-flash', temperature=0.7):
+    def __init__(self, model_name='gemini-1.5-flash-8b', temperature=0.7):
         # APIキーの設定
         GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
         genai.configure(api_key=GOOGLE_API_KEY)
@@ -23,19 +23,16 @@ class LLM:
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
 
+        # チャットの初期化
+        self.chat = self.model.start_chat(history=[])
+
     def generate(self, prompt):
         # テキスト生成
-        response = self.model.generate_content(
-            prompt,  
-            # generation_config=self.generation_config,
-            safety_settings=self.safety_settings,
-        )
-        try:
-            print(response.text)
-        except ValueError:
-            print(response.prompt_feedback)
+        response = self.chat.send_message(prompt, stream=True)
 
-        return response.text
+        for chunk in response:
+            # print(chunk.text)
+            yield chunk.text
 
 if __name__ == "__main__":
     llm = LLM()
