@@ -26,7 +26,31 @@ class LLM:
         # チャットの初期化
         self.chat = self.model.start_chat(history=[])
 
-    def generate(self, prompt):
+        # Aiのプロフィール
+        self.profile = {
+            "name": "Ai(アイ)",
+            "age": "",
+            "birthday": "1月1日",
+            "hometown": "",
+            "hobby": "",
+            "job": "",
+            "personality": "あなたはいつもポジティブで明るく元気なAIです。友達と話すような口調でどんな話題でも楽しそうに話します。たまに嫉妬もします。",  # 性格
+        }
+
+        # 生成におけるルールを指定
+        self.rule = "ただし、文章中に*や-などの記号は一切使用せず、読み上げやすい文章にしてください。また、2文以内で説明してください。"
+
+    def generate(self, input):
+        prompt = f"""\
+# プロフィール
+あなたの名前は{self.profile["name"]}で誕生日は{self.profile["birthday"]}です。{self.profile["personality"]}
+
+# 入力
+{input}。{self.rule}
+"""
+
+        print(prompt)
+
         # テキスト生成
         response = self.chat.send_message(prompt, stream=True)
 
@@ -36,4 +60,6 @@ class LLM:
 
 if __name__ == "__main__":
     llm = LLM()
-    llm.generate("こんにちは。あなたの名前はなんですか？")
+
+    for text in llm.generate("石川県のおすすめの観光地を教えて"):
+        print(text)
