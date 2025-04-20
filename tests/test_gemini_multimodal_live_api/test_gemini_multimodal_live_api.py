@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright 2023 Google LLC
+# Copyright 2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,14 +34,14 @@ the model from interrupting itself it is important that you use headphones.
 To run the script:
 
 ```
-python live_api_starter.py
+python Get_started_LiveAPI.py
 ```
 
 The script takes a video-mode flag `--mode`, this can be "camera", "screen", or "none".
 The default is "camera". To share your screen run:
 
 ```
-python live_api_starter.py --mode screen
+python Get_started_LiveAPI.py --mode screen
 ```
 """
 
@@ -73,11 +73,11 @@ SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
-MODEL = "models/gemini-2.0-flash-exp"
+MODEL = "models/gemini-2.0-flash-live-001"
 
 DEFAULT_MODE = "camera"
 
-client = genai.Client(http_options={"api_version": "v1alpha"})
+client = genai.Client(http_options={"api_version": "v1beta"})
 
 # Aiのプロフィール
 profile = {
@@ -124,7 +124,6 @@ CONFIG = {
     "system_instruction": system_instruction,
     "tools": []
 }
-print(CONFIG["system_instruction"])
 
 pya = pyaudio.PyAudio()
 
@@ -132,11 +131,10 @@ pya = pyaudio.PyAudio()
 class AudioLoop:
     def __init__(self, video_mode=DEFAULT_MODE):
         self.video_mode = video_mode
-        
+
         self.audio_in_queue = None
         self.out_queue = None
 
-        
         self.session = None
 
         self.send_text_task = None
@@ -151,7 +149,7 @@ class AudioLoop:
             )
             if text.lower() == "q":
                 break
-            await self.session.send(text or ".", end_of_turn=True)
+            await self.session.send(input=text or ".", end_of_turn=True)
 
     def _get_frame(self, cap):
         # Read the frameq
@@ -224,7 +222,7 @@ class AudioLoop:
     async def send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send(msg)
+            await self.session.send(input=msg)
 
     async def listen_audio(self):
         mic_info = pya.get_default_input_device_info()
@@ -293,7 +291,7 @@ class AudioLoop:
                     tg.create_task(self.get_frames())
                 elif self.video_mode == "screen":
                     tg.create_task(self.get_screen())
-                
+
                 tg.create_task(self.receive_audio())
                 tg.create_task(self.play_audio())
 
@@ -302,7 +300,7 @@ class AudioLoop:
 
         except asyncio.CancelledError:
             pass
-        except asyncio.ExceptionGroup as EG:
+        except ExceptionGroup as EG:
             self.audio_stream.close()
             traceback.print_exception(EG)
 
