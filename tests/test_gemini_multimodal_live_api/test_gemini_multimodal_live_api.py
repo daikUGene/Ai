@@ -119,7 +119,11 @@ CONFIG = {
                     "voice_name": "Aoede"
                 }
             }
-        }
+        },
+        "proactivity": {
+            "proactive_audio": True
+        },
+        "enable_affective_dialog": True,
     },
     "system_instruction": system_instruction,
     "tools": []
