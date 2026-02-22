@@ -81,7 +81,7 @@ DEFAULT_MODE = "camera"
 
 client = genai.Client(
     api_key=os.environ.get("GEMINI_API_KEY"),
-    http_options={"api_version": "v1beta"},
+    http_options={"api_version": "v1alpha"},
 )
 
 # Live session configuration
@@ -97,6 +97,10 @@ CONFIG = types.LiveConnectConfig(
     context_window_compression=types.ContextWindowCompressionConfig(
         trigger_tokens = 25600,
         sliding_window = types.SlidingWindow(target_tokens=12800),
+    ),
+    enable_affective_dialog=True,
+    proactivity=types.ProactivityConfig(
+        proactive_audio=True,
     ),
 )
 
