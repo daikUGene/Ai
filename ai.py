@@ -324,7 +324,8 @@ class AudioVideoLoop:
         except asyncio.CancelledError:
             pass
         except ExceptionGroup as EG:
-            self.audio_stream.close()
+            if self.audio_stream:
+                self.audio_stream.close()
             traceback.print_exception(EG)
 
 
