@@ -87,6 +87,8 @@ client = genai.Client(
 # Live session configuration
 # Trigger tokens sent so that model does not hallucinate in long conversations
 # Sliding window to retain the context within the context window limit
+
+# --- Main Session Configuration ---
 CONFIG = types.LiveConnectConfig(
     response_modalities=["AUDIO"],
     speech_config=types.SpeechConfig(
@@ -104,18 +106,58 @@ CONFIG = types.LiveConnectConfig(
     ),
 )
 
+# --- Backchannel Session Configuration ---
+BACKCHANNEL_CONFIG = types.LiveConnectConfig(
+    response_modalities=["AUDIO"],
+    speech_config=types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
+        )
+    ),
+    max_output_tokens=50,
+    system_instruction=types.Content(
+        parts=[types.Part(text=(
+            "あなたは相槌専用のアシスタントです。"
+            "ユーザーの話を聞いて、2文字以内の短い相槌（「うん」「はい」「へー」「ふーん」「なるほど」）だけを返してください。"
+            "それ以外の言葉は絶対に発しないでください。"
+            "質問に答えてはいけません。長い文章を話してはいけません。"
+        ))]
+    ),
+    enable_affective_dialog=True,
+    realtime_input_config=types.RealtimeInputConfig(
+        activity_handling=types.ActivityHandling.NO_INTERRUPTION,
+        automatic_activity_detection=types.AutomaticActivityDetection(
+            silence_duration_ms=300,
+            end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+        ),
+    ),
+)
+
 pya = pyaudio.PyAudio()
 
 
 class AudioVideoLoop:
-    def __init__(self, video_mode=DEFAULT_MODE):
+    def __init__(self, video_mode=DEFAULT_MODE, backchannel=False):
         self.video_mode = video_mode
+        self.backchannel_enabled = backchannel
 
+        # Main session queues
         self.audio_in_queue = asyncio.Queue()
         self.out_queue = asyncio.Queue(maxsize = 5) # Limit size to avoid excess memory use
 
+        # Backchannel session queues
+        self.bc_audio_in_queue = asyncio.Queue()
+        self.bc_out_queue = asyncio.Queue(maxsize = 5)
+
+        # Sessions
         self.session = None
+        self.bc_session = None
         self.audio_stream = None
+
+        # Synchronization: backchannel playback state
+        # This event is SET when backchannel is NOT playing (i.e. main can proceed)
+        self.bc_playback_done = asyncio.Event()
+        self.bc_playback_done.set()  # Initially not playing
 
     # --- Audio Handling ---
 
@@ -142,13 +184,24 @@ class AudioVideoLoop:
                     "data": data,
                     "mime_type": "audio/pcm"
                 }
+
                 # To reduce latency instead of watiing to push in queue we pop oldest item in queue if its full
                 # This helps to keep the audio stream real time
+
+                # Send to main session queue
                 try:
                     self.out_queue.put_nowait(payload)
                 except asyncio.QueueFull:
                     _ = self.out_queue.get_nowait()  
                     self.out_queue.put_nowait(payload)
+
+                # Also send to backchannel session queue if enabled
+                if self.backchannel_enabled:
+                    try:
+                        self.bc_out_queue.put_nowait(payload)
+                    except asyncio.QueueFull:
+                        _ = self.bc_out_queue.get_nowait()
+                        self.bc_out_queue.put_nowait(payload)
 
         except asyncio.CancelledError:
             pass
@@ -168,6 +221,11 @@ class AudioVideoLoop:
         try:
             while True:
                 bytestream = await self.audio_in_queue.get()
+
+                # Wait for backchannel playback to finish before playing main audio
+                if self.backchannel_enabled:
+                    await self.bc_playback_done.wait()
+
                 await asyncio.to_thread(stream.write, bytestream)
         except asyncio.CancelledError:
             pass
@@ -196,6 +254,69 @@ class AudioVideoLoop:
                     self.audio_in_queue.get_nowait()
         except asyncio.CancelledError:
             pass
+
+    # --- Backchannel Handling ---
+
+    async def send_realtime_backchannel(self):
+        """Send audio to the backchannel session."""
+        try:
+            while True:
+                msg = await self.bc_out_queue.get()
+                if msg["mime_type"].startswith("audio/"):
+                    await self.bc_session.send_realtime_input(audio=msg)
+                else:
+                    await self.bc_session.send_realtime_input(media=msg)
+        except asyncio.CancelledError:
+            pass
+
+    async def receive_backchannel_audio(self):
+        """Read from the backchannel session and write PCM chunks to the bc audio queue."""
+        try:
+            while True:
+                turn = self.bc_session.receive()
+                async for response in turn:
+                    if data := response.data:
+                        self.bc_audio_in_queue.put_nowait(data)
+                        continue
+                    # Ignore text from backchannel session
+
+                # Backchannel turn complete - clear any remaining audio
+                while not self.bc_audio_in_queue.empty():
+                    self.bc_audio_in_queue.get_nowait()
+        except asyncio.CancelledError:
+            pass
+
+    async def play_backchannel_audio(self):
+        """Play backchannel audio using the same output stream."""
+        stream = await asyncio.to_thread(
+            pya.open,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RECEIVE_SAMPLE_RATE,
+            output=True,
+        )
+        try:
+            while True:
+                bytestream = await self.bc_audio_in_queue.get()
+
+                # Signal that backchannel is playing
+                self.bc_playback_done.clear()
+
+                await asyncio.to_thread(stream.write, bytestream)
+
+                # If the bc queue is empty, we're done playing this backchannel turn
+                if self.bc_audio_in_queue.empty():
+                    # Small delay to allow any remaining chunks to arrive
+                    await asyncio.sleep(0.05)
+                    if self.bc_audio_in_queue.empty():
+                        self.bc_playback_done.set()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.bc_playback_done.set()
+            if stream:
+                stream.stop_stream()
+                stream.close()
 
     # --- Video Handling ---
 
@@ -300,30 +421,69 @@ class AudioVideoLoop:
     async def run(self):
         """Run all tasks to handle audio/video/text interaction"""
         try:
-            async with (
-                client.aio.live.connect(model=MODEL, config=CONFIG) as session,
-                asyncio.TaskGroup() as tg,
-            ):
-                self.session = session
+            if self.backchannel_enabled:
+                print("🎙️ Backchannel (相槌) mode enabled")
+                async with (
+                    client.aio.live.connect(model=MODEL, config=CONFIG) as main_session,
+                    client.aio.live.connect(model=MODEL, config=BACKCHANNEL_CONFIG) as bc_session,
+                    asyncio.TaskGroup() as tg,
+                ):
+                    self.session = main_session
+                    self.bc_session = bc_session
 
-                # Re-initialize queue for fresh session
-                self.audio_in_queue = asyncio.Queue()
-                self.out_queue = asyncio.Queue(maxsize=5)
+                    # Re-initialize queues for fresh session
+                    self.audio_in_queue = asyncio.Queue()
+                    self.out_queue = asyncio.Queue(maxsize=5)
+                    self.bc_audio_in_queue = asyncio.Queue()
+                    self.bc_out_queue = asyncio.Queue(maxsize=5)
+                    self.bc_playback_done = asyncio.Event()
+                    self.bc_playback_done.set()
 
-                send_text_task = tg.create_task(self.send_text())
-                tg.create_task(self.send_realtime())
-                tg.create_task(self.listen_audio())
-                
-                if self.video_mode == "camera":
-                    tg.create_task(self.capture_frames())
-                elif self.video_mode == "screen":
-                    tg.create_task(self.capture_screen())
+                    # Main session tasks
+                    send_text_task = tg.create_task(self.send_text())
+                    tg.create_task(self.send_realtime())
+                    tg.create_task(self.listen_audio())
+                    
+                    if self.video_mode == "camera":
+                        tg.create_task(self.capture_frames())
+                    elif self.video_mode == "screen":
+                        tg.create_task(self.capture_screen())
 
-                tg.create_task(self.receive_audio())
-                tg.create_task(self.play_audio())
+                    tg.create_task(self.receive_audio())
+                    tg.create_task(self.play_audio())
 
-                await send_text_task
-                raise asyncio.CancelledError("User requested exit")
+                    # Backchannel session tasks
+                    tg.create_task(self.send_realtime_backchannel())
+                    tg.create_task(self.receive_backchannel_audio())
+                    tg.create_task(self.play_backchannel_audio())
+
+                    await send_text_task
+                    raise asyncio.CancelledError("User requested exit")
+            else:
+                async with (
+                    client.aio.live.connect(model=MODEL, config=CONFIG) as session,
+                    asyncio.TaskGroup() as tg,
+                ):
+                    self.session = session
+
+                    # Re-initialize queue for fresh session
+                    self.audio_in_queue = asyncio.Queue()
+                    self.out_queue = asyncio.Queue(maxsize=5)
+
+                    send_text_task = tg.create_task(self.send_text())
+                    tg.create_task(self.send_realtime())
+                    tg.create_task(self.listen_audio())
+                    
+                    if self.video_mode == "camera":
+                        tg.create_task(self.capture_frames())
+                    elif self.video_mode == "screen":
+                        tg.create_task(self.capture_screen())
+
+                    tg.create_task(self.receive_audio())
+                    tg.create_task(self.play_audio())
+
+                    await send_text_task
+                    raise asyncio.CancelledError("User requested exit")
 
         except asyncio.CancelledError:
             pass
@@ -342,6 +502,12 @@ if __name__ == "__main__":
         help="pixels to stream from",
         choices=["camera", "screen", "none"],
     )
+    parser.add_argument(
+        "--backchannel",
+        action="store_true",
+        default=False,
+        help="Enable backchannel (相槌) mode with a second session",
+    )
     args = parser.parse_args()
-    main = AudioVideoLoop(video_mode=args.mode)
+    main = AudioVideoLoop(video_mode=args.mode, backchannel=args.backchannel)
     asyncio.run(main.run())
