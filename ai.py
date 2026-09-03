@@ -104,6 +104,7 @@ CONFIG = types.LiveConnectConfig(
     proactivity=types.ProactivityConfig(
         proactive_audio=True,
     ),
+    thinking_config=types.ThinkingConfig(thinking_budget=0),  # thinking OFF
 )
 
 # --- Backchannel Session Configuration ---
@@ -114,7 +115,6 @@ BACKCHANNEL_CONFIG = types.LiveConnectConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
         )
     ),
-    max_output_tokens=50,
     system_instruction=types.Content(
         parts=[types.Part(text=(
             "あなたは相槌専用のアシスタントです。"
@@ -124,13 +124,16 @@ BACKCHANNEL_CONFIG = types.LiveConnectConfig(
         ))]
     ),
     enable_affective_dialog=True,
+    # proactivity=types.ProactivityConfig(
+    #     proactive_audio=True,
+    # ),
     realtime_input_config=types.RealtimeInputConfig(
-        activity_handling=types.ActivityHandling.NO_INTERRUPTION,
         automatic_activity_detection=types.AutomaticActivityDetection(
             silence_duration_ms=300,
             end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
         ),
     ),
+    thinking_config=types.ThinkingConfig(thinking_budget=0),  # thinking OFF
 )
 
 pya = pyaudio.PyAudio()
@@ -158,6 +161,10 @@ class AudioVideoLoop:
         # This event is SET when backchannel is NOT playing (i.e. main can proceed)
         self.bc_playback_done = asyncio.Event()
         self.bc_playback_done.set()  # Initially not playing
+
+        # This event is SET when all audio chunks from the backchannel session have been received
+        # Used by play_backchannel_audio to know it can mark playback as done once queue is drained
+        self.bc_all_chunks_received = asyncio.Event()
 
     # --- Audio Handling ---
 
@@ -263,6 +270,7 @@ class AudioVideoLoop:
             while True:
                 msg = await self.bc_out_queue.get()
                 if msg["mime_type"].startswith("audio/"):
+                    print("send_realtime_backchannel")
                     await self.bc_session.send_realtime_input(audio=msg)
                 else:
                     await self.bc_session.send_realtime_input(media=msg)
@@ -273,16 +281,19 @@ class AudioVideoLoop:
         """Read from the backchannel session and write PCM chunks to the bc audio queue."""
         try:
             while True:
+                self.bc_all_chunks_received.clear()
                 turn = self.bc_session.receive()
                 async for response in turn:
+                    print(f"[BC Server] response received: {response}")
                     if data := response.data:
+                        print("receive_backchannel_audio")
                         self.bc_audio_in_queue.put_nowait(data)
                         continue
                     # Ignore text from backchannel session
 
-                # Backchannel turn complete - clear any remaining audio
-                while not self.bc_audio_in_queue.empty():
-                    self.bc_audio_in_queue.get_nowait()
+                # Signal that all chunks for this turn have been received
+                # Do NOT clear the queue here — let play_backchannel_audio drain it
+                self.bc_all_chunks_received.set()
         except asyncio.CancelledError:
             pass
 
@@ -299,17 +310,20 @@ class AudioVideoLoop:
             while True:
                 bytestream = await self.bc_audio_in_queue.get()
 
+                print("play_backchannel_audio 1")
+
                 # Signal that backchannel is playing
                 self.bc_playback_done.clear()
 
                 await asyncio.to_thread(stream.write, bytestream)
 
-                # If the bc queue is empty, we're done playing this backchannel turn
-                if self.bc_audio_in_queue.empty():
-                    # Small delay to allow any remaining chunks to arrive
-                    await asyncio.sleep(0.05)
-                    if self.bc_audio_in_queue.empty():
-                        self.bc_playback_done.set()
+                print("play_backchannel_audio 2")
+
+                # Check if this backchannel audio is fully played:
+                # both all_chunks_received flag is set AND no more chunks in queue
+                if self.bc_all_chunks_received.is_set() and self.bc_audio_in_queue.empty():
+                    print("play_backchannel_audio 3")
+                    self.bc_playback_done.set()
         except asyncio.CancelledError:
             pass
         finally:
@@ -438,6 +452,7 @@ class AudioVideoLoop:
                     self.bc_out_queue = asyncio.Queue(maxsize=5)
                     self.bc_playback_done = asyncio.Event()
                     self.bc_playback_done.set()
+                    self.bc_all_chunks_received = asyncio.Event()
 
                     # Main session tasks
                     send_text_task = tg.create_task(self.send_text())
