@@ -14,49 +14,33 @@
 # limitations under the License.
 
 """
-## Setup
-
-To install the dependencies for this script, run:
-
-``` 
-pip install google-genai opencv-python pyaudio pillow mss
-```
-
-Before running this script, ensure the `GOOGLE_API_KEY` environment
-variable is set to the api-key you obtained from Google AI Studio.
-
-Important: **Use headphones**. This script uses the system default audio
-input and output, which often won't include echo cancellation. So to prevent
-the model from interrupting itself it is important that you use headphones. 
-
-## Run
-
-To run the script:
-
-```
-python Get_started_LiveAPI.py
-```
-
-The script takes a video-mode flag `--mode`, this can be "camera", "screen", or "none".
-The default is "camera". To share your screen run:
-
-```
-python Get_started_LiveAPI.py --mode screen
-```
+Ai (アイ) - ハイブリッド音声対話エージェント
+ローカルのMaAI（VAPモデル）によるリアルタイム相槌・ターンテイキング予測と、
+Gemini Multimodal Live APIによる思考・回答生成を統合したシステム。
 """
 
+import argparse
 import asyncio
 import base64
+import collections
+from enum import Enum, auto
 import io
+import math
 import os
+import queue
+import random
+import struct
 import sys
+import threading
+import time
 import traceback
-import argparse
+import wave
 
 import cv2
-import pyaudio
+import numpy as np
 import PIL.Image
 import mss
+import pyaudio
 
 from google import genai
 from google.genai import types
@@ -67,36 +51,97 @@ if sys.version_info < (3, 11, 0):
     asyncio.TaskGroup = taskgroup.TaskGroup
     asyncio.ExceptionGroup = exceptiongroup.ExceptionGroup
 
-# --- Audio Configuration ---
+# ==============================================================================
+# 設定パラメータ
+# ==============================================================================
+
+# --- 音声IO設定 ---
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
+BYTES_PER_SAMPLE_INT16 = 2
+INT16_MAX = 32767
+INT16_MIN = -32768
+INT16_SCALE = 32768.0
 
-# --- Model Configuration ---
+# --- ターンテイキング（Turn Shift）---
+# 発話終了検知（Turn Shift）閾値
+THRESHOLD_P_SHIFT = 0.65
+# デバウンス: 判定確定に必要な連続フレーム数 (2〜3フレーム: 約40〜60ms)
+DEBOUNCE_FRAMES_SHIFT = 2
+
+# --- 相槌（Backchannel） ---
+# 相槌機会検知（Backchannel）閾値
+THRESHOLD_P_BC = 0.70
+# デバウンス: 相槌判定に必要な連続フレーム数 (2〜3フレーム)
+DEBOUNCE_FRAMES_BC = 2
+# 相槌発動後のクールダウン時間（秒: 1.2〜1.5秒）
+BC_COOLDOWN_SEC = 1.3
+# 初期デフォルト音量 (RMS)
+BC_INITIAL_USER_RMS = 300.0
+# 音声未作成時の仮相槌待機時間（秒）
+BC_MOCK_DURATION_SEC = 0.35
+
+# --- 相槌の音響変調パラメータ ---
+# ピッチ / 速度変調の最大変動幅 (±3%〜5%)
+BC_PITCH_VARIATION_RANGE = 0.04
+# ユーザー直近音量 (RMS) 追従の平滑化係数 (EMA)
+BC_RMS_SMOOTHING = 0.85
+# 相槌の最小・最大ゲイン倍率
+BC_MIN_GAIN = 0.4
+BC_MAX_GAIN = 1.3
+# ゲイン基準となるユーザー発話目標RMS値
+BC_TARGET_USER_RMS = 600.0
+
+# 相槌WAVファイルの配置ディレクトリ
+BACKCHANNEL_AUDIO_DIR = os.path.join(os.path.dirname(__file__), "assets", "backchannels")
+
+# --- MaAI (VAPモデル) 設定 ---
+MAAI_SAMPLE_RATE = 16000
+MAAI_FRAME_SIZE = 160
+MAAI_FRAME_RATE = 10
+MAAI_CONTEXT_LEN_SEC = 5
+MAAI_POLL_INTERVAL_SEC = 0.05
+MAAI_IDLE_SLEEP_SEC = 0.1
+SYSTEM_AUDIO_MAX_QUEUE_SIZE = 5
+SYSTEM_AUDIO_POLL_INTERVAL_SEC = 0.002
+
+# --- 映像・キュー設定 ---
+OUT_QUEUE_MAX_SIZE = 5
+IMAGE_MAX_SIZE = (1024, 1024)
+VIDEO_FRAME_INTERVAL_SEC = 1.0
+
+# --- Geminiモデル設定 ---
 MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 DEFAULT_MODE = "camera"
 
-
-client = genai.Client(
-    api_key=os.environ.get("GEMINI_API_KEY"),
-    http_options={"api_version": "v1alpha"},
-)
+# 仕様書に基づくシステムプロンプト
+# 文頭に自然な相槌・フィラーを含めて一括返答させる
+SYSTEM_INSTRUCTION = """\
+あなたはいつもポジティブで明るく元気なAI「Ai（アイ）」です。
+友達と話すような親しみやすい口調で、どんな話題でも楽しそうに会話します。
+下記のルールを厳格に守ってください。
+・返答の文頭には自然な相槌やフィラー（「うん」「そうだね」「あー」「なるほど」など）を必ず含めて一括返答してください。
+・文章中に*や-などの記号やマークダウンは一切使用せず、音声読み上げに適したプレーンな日本語にしてください。
+・簡潔に1〜2文程度でテンポよく返答してください。
+"""
 
 # Live session configuration
-# Trigger tokens sent so that model does not hallucinate in long conversations
-# Sliding window to retain the context within the context window limit
 CONFIG = types.LiveConnectConfig(
     response_modalities=["AUDIO"],
     speech_config=types.SpeechConfig(
         voice_config=types.VoiceConfig(
-            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name = "Zephyr")
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
         )
     ),
+    system_instruction=types.Content(
+        parts=[types.Part.from_text(text=SYSTEM_INSTRUCTION)]
+    ),
     context_window_compression=types.ContextWindowCompressionConfig(
-        trigger_tokens = 25600,
-        sliding_window = types.SlidingWindow(target_tokens=12800),
+        trigger_tokens=25600,
+        sliding_window=types.SlidingWindow(target_tokens=12800),
     ),
     enable_affective_dialog=True,
     proactivity=types.ProactivityConfig(
@@ -106,16 +151,437 @@ CONFIG = types.LiveConnectConfig(
 
 pya = pyaudio.PyAudio()
 
+# ==============================================================================
+# ステートマシン定義
+# ==============================================================================
+
+class DialogueState(Enum):
+    STATE_LISTENING = auto()            # 通常傾聴状態
+    STATE_PROCESSING_GEMINI = auto()    # Geminiへ投機的発注＆回答処理・再生中
+
+
+class DialogueStateMachine:
+    """
+    - P_shift 優先度制御
+    - デバウンス判定
+    - 相槌クールダウン
+    - 相槌と発話終了の競合（連動処理）
+    """
+    def __init__(self, on_shift_callback, on_bc_callback):
+        self.state = DialogueState.STATE_LISTENING
+        self.on_shift_callback = on_shift_callback
+        self.on_bc_callback = on_bc_callback
+
+        self.last_bc_time = 0.0
+        self.shift_debounce_count = 0
+        self.bc_debounce_count = 0
+
+    def update_predictions(self, p_shift: float, p_bc: float, bc_category: str = "reactive"):
+        now = time.time()
+
+        # デバウンスのカウント処理
+        if p_shift > THRESHOLD_P_SHIFT:
+            self.shift_debounce_count += 1
+        else:
+            self.shift_debounce_count = 0
+
+        if p_bc > THRESHOLD_P_BC:
+            self.bc_debounce_count += 1
+        else:
+            self.bc_debounce_count = 0
+
+        # 1. 優先度制御 (P_shift 優先)
+        if self.shift_debounce_count >= DEBOUNCE_FRAMES_SHIFT:
+            self.shift_debounce_count = 0
+            if self.state == DialogueState.STATE_LISTENING:
+                print(f"[!] [StateMachine] P_shift確定 ({p_shift:.2f}) -> STATE_PROCESSING_GEMINI に遷移")
+                self.state = DialogueState.STATE_PROCESSING_GEMINI
+                # Geminiへの投機的発話要求
+                asyncio.create_task(self.on_shift_callback())
+                return
+
+        # 2. 相槌判定 (LISTENING かつ クールダウン経過後)
+        if self.state == DialogueState.STATE_LISTENING:
+            if self.bc_debounce_count >= DEBOUNCE_FRAMES_BC:
+                self.bc_debounce_count = 0
+                time_since_last_bc = now - self.last_bc_time
+                if time_since_last_bc >= BC_COOLDOWN_SEC:
+                    self.last_bc_time = now
+                    print(f"[*] [StateMachine] P_bc確定 ({p_bc:.2f}, cat={bc_category}) -> 相槌再生トリガー")
+                    asyncio.create_task(self.on_bc_callback(bc_category))
+                else:
+                    # クールダウン中
+                    pass
+
+    def on_gemini_completed(self):
+        """Geminiの回答終了により通常傾聴状態へ復帰"""
+        if self.state != DialogueState.STATE_LISTENING:
+            print("[i] [StateMachine] Gemini回答完了 -> STATE_LISTENING に復帰")
+            self.state = DialogueState.STATE_LISTENING
+            self.shift_debounce_count = 0
+            self.bc_debounce_count = 0
+
+
+# ==============================================================================
+# 相槌（Backchannel）生成・再生マネージャ
+# ==============================================================================
+
+class BackchannelManager:
+    """
+    相槌再生エンジン:
+    - WAV音声ファイル
+    - ピッチ/話速のランダム変調
+    - ユーザー直近入力音量 (RMS) への音量リアルタイム追従 (Gain)
+    - カテゴリ分類 (reactive, emotional, thoughtful)
+    """
+    def __init__(self, audio_dir=BACKCHANNEL_AUDIO_DIR):
+        self.audio_dir = audio_dir
+        self.current_user_rms = BC_INITIAL_USER_RMS
+        self.category_samples = {
+            "reactive": ["うん", "はい", "そう"],
+            "emotional": ["へぇー", "あー", "うわ"],
+            "thoughtful": ["なるほど", "ふむ"],
+        }
+        self.output_stream = None
+
+    def update_user_rms(self, pcm_data: bytes):
+        """マイク入力PCMからRMS（音量）を計算し平滑化更新"""
+        if not pcm_data:
+            return
+        count = len(pcm_data) // BYTES_PER_SAMPLE_INT16
+        if count == 0:
+            return
+        shorts = struct.unpack(f"{count}h", pcm_data)
+        sum_squares = sum(s * s for s in shorts)
+        rms = math.sqrt(sum_squares / count)
+        # 指数移動平均 (EMA) で平滑化
+        self.current_user_rms = (
+            BC_RMS_SMOOTHING * self.current_user_rms + (1.0 - BC_RMS_SMOOTHING) * rms
+        )
+
+    def calculate_gain(self) -> float:
+        """ユーザーのRMSに基づいて再生ゲインを算出"""
+        ratio = self.current_user_rms / max(BC_TARGET_USER_RMS, 1.0)
+        gain = max(BC_MIN_GAIN, min(BC_MAX_GAIN, ratio))
+        return gain
+
+    async def play_backchannel(self, category: str = "reactive", on_audio_chunk=None):
+        """相槌の再生処理（WAVがあれば変調再生、未作成時は仮実装としてログとダミー待機）"""
+        # カテゴリに応じたフレーズ選定
+        phrases = self.category_samples.get(category, self.category_samples["reactive"])
+        phrase = random.choice(phrases)
+        gain = self.calculate_gain()
+        # ピッチ/話速のランダム変動
+        pitch_factor = 1.0 + random.uniform(-BC_PITCH_VARIATION_RANGE, BC_PITCH_VARIATION_RANGE)
+
+        # WAVファイルを探す
+        category_dir = os.path.join(self.audio_dir, category)
+        wav_file = None
+        if os.path.exists(category_dir):
+            files = [f for f in os.listdir(category_dir) if f.endswith(".wav")]
+            if files:
+                wav_file = os.path.join(category_dir, random.choice(files))
+
+        if wav_file and os.path.exists(wav_file):
+            print(f"[>] [Backchannel] WAV再生: {os.path.basename(wav_file)} (gain={gain:.2f}, pitch_factor={pitch_factor:.3f})")
+            await asyncio.to_thread(self._play_wav_with_modulation, wav_file, gain, pitch_factor, on_audio_chunk)
+        else:
+            # 音声ファイル未作成時の仮実装 (Mock再生)
+            print(f"[>] [Backchannel (Mock)] 相槌発声: 『{phrase}』 (cat={category}, gain={gain:.2f}, pitch={pitch_factor:.3f})")
+            # 人間の相槌長をシミュレート
+            await asyncio.sleep(BC_MOCK_DURATION_SEC)
+
+    def _play_wav_with_modulation(self, wav_path: str, gain: float, pitch_factor: float, on_audio_chunk=None):
+        """WAVファイルをゲイン適用およびサンプルレート変調で再生"""
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                sample_rate = int(wf.getframerate() * pitch_factor)
+                channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+
+                stream = pya.open(
+                    format=pya.get_format_from_width(sampwidth),
+                    channels=channels,
+                    rate=sample_rate,
+                    output=True,
+                )
+                chunk = CHUNK_SIZE
+                data = wf.readframes(chunk)
+                while data:
+                    if gain != 1.0 and sampwidth == BYTES_PER_SAMPLE_INT16:
+                        count = len(data) // BYTES_PER_SAMPLE_INT16
+                        shorts = struct.unpack(f"{count}h", data)
+                        modulated = [int(max(INT16_MIN, min(INT16_MAX, s * gain))) for s in shorts]
+                        data = struct.pack(f"{count}h", *modulated)
+                    if on_audio_chunk:
+                        on_audio_chunk(data, in_sample_rate=sample_rate)
+                    stream.write(data)
+                    data = wf.readframes(chunk)
+
+                stream.stop_stream()
+                stream.close()
+        except Exception as e:
+            print(f"[WARN] [Backchannel] WAV再生エラー: {e}")
+
+
+# ==============================================================================
+# MaAI 2ch システム音声入力 (SystemAudioInput)
+# ==============================================================================
+
+try:
+    from maai.input import Base as MaaiInputBase
+except ImportError:
+    class MaaiInputBase:
+        FRAME_SIZE = MAAI_FRAME_SIZE
+        SAMPLING_RATE = MAAI_SAMPLE_RATE
+
+        def __init__(self):
+            self._subscriber_queues = []
+            self._lock = threading.Lock()
+            self._is_thread_started = False
+            self.channels = 1
+
+        def subscribe(self):
+            q = queue.Queue()
+            with self._lock:
+                self._subscriber_queues.append(q)
+            return q
+
+        def _put_to_all_queues(self, data):
+            with self._lock:
+                for q in self._subscriber_queues:
+                    q.put(data)
+
+        def get_audio_data(self, q=None):
+            return q.get()
+
+        def _get_queue_size(self):
+            with self._lock:
+                return sum(len(q.queue) for q in self._subscriber_queues)
+
+
+class SystemAudioInput(MaaiInputBase):
+    """
+    MaAI 2ch (Channel 2) 用のシステム音声入力ソース。
+    AI発話中 (Gemini回答や相槌) はその音声をリサンプリング (16kHz float32) して供給し、
+    非発声時（アイドル時）はゼロ配列（無音データ）をリアルタイムに供給する。
+    """
+    def __init__(
+        self,
+        sample_rate: int = MAAI_SAMPLE_RATE,
+        frame_size: int = MAAI_FRAME_SIZE,
+        max_queue_size: int = SYSTEM_AUDIO_MAX_QUEUE_SIZE,
+    ):
+        super().__init__()
+        self.sampling_rate = sample_rate
+        self.frame_size = frame_size
+        self.max_queue_size = max_queue_size
+        self._audio_buffer = collections.deque()
+        self._buffer_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._worker_thread = None
+
+    def put_audio_pcm(self, pcm_bytes: bytes, in_sample_rate: int = RECEIVE_SAMPLE_RATE):
+        """システム音声のPCMバイト列を受信し、16kHz float32に変換してバッファに追加"""
+        if not pcm_bytes:
+            return
+        count = len(pcm_bytes) // BYTES_PER_SAMPLE_INT16
+        if count == 0:
+            return
+        shorts = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / INT16_SCALE
+        if in_sample_rate != self.sampling_rate and count > 1:
+            # 24kHz -> 16kHz リサンプリング
+            num_target = int(round(count * self.sampling_rate / in_sample_rate))
+            if num_target > 0:
+                resampled = np.interp(
+                    np.linspace(0, count, num_target, endpoint=False),
+                    np.arange(count),
+                    shorts,
+                ).astype(np.float32)
+            else:
+                resampled = np.empty(0, dtype=np.float32)
+        else:
+            resampled = shorts
+
+        with self._buffer_lock:
+            self._audio_buffer.extend(resampled.tolist())
+
+    def clear_buffer(self):
+        """発話完了時や割り込み時にシステム音声バッファおよびキューをクリア"""
+        with self._buffer_lock:
+            self._audio_buffer.clear()
+        with self._lock:
+            for q in self._subscriber_queues:
+                try:
+                    while not q.empty():
+                        q.get_nowait()
+                except Exception:
+                    pass
+
+    def _process_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                if self._get_queue_size() >= self.max_queue_size:
+                    time.sleep(SYSTEM_AUDIO_POLL_INTERVAL_SEC)
+                    continue
+
+                with self._buffer_lock:
+                    buf_len = len(self._audio_buffer)
+                    if buf_len >= self.frame_size:
+                        frame = [self._audio_buffer.popleft() for _ in range(self.frame_size)]
+                    elif buf_len > 0:
+                        frame = [self._audio_buffer.popleft() for _ in range(buf_len)]
+                        frame.extend([0.0] * (self.frame_size - buf_len))
+                    else:
+                        frame = [0.0] * self.frame_size
+
+                self._put_to_all_queues(frame)
+            except Exception as e:
+                time.sleep(SYSTEM_AUDIO_POLL_INTERVAL_SEC)
+
+    def start(self):
+        if not self._is_thread_started:
+            self._stop_event.clear()
+            self._worker_thread = threading.Thread(target=self._process_loop, daemon=True)
+            self._worker_thread.start()
+            self._is_thread_started = True
+
+    def stop(self):
+        self._stop_event.set()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.0)
+
+
+# ==============================================================================
+# MaAI (VAPモデル) 連携コントローラ
+# ==============================================================================
+
+class MaaiController:
+    """
+    MaAI連携部:
+    - 2ch音声（Ch1: ユーザーPCM, Ch2: システムAI音声 / 無音ストリーム）の管理
+    - VAPモデルによる P_shift, P_bc のリアルタイム予測
+    """
+    def __init__(self, state_machine: DialogueStateMachine):
+        self.state_machine = state_machine
+        self.maai_instance = None
+        self.is_running = False
+        self.system_audio = SystemAudioInput()
+
+        self._init_maai()
+
+    def _init_maai(self):
+        try:
+            from maai import Maai, MaaiInput
+            # Ch1: Mic, Ch2: SystemAudioInput
+            mic = MaaiInput.Mic(mic_device_index=0)
+            try:
+                self.maai_instance = Maai(
+                    mode=["vap_mc", "bc_2type"],
+                    lang="jp",
+                    frame_rate=MAAI_FRAME_RATE,
+                    context_len_sec=MAAI_CONTEXT_LEN_SEC,
+                    audio_ch1=mic,
+                    audio_ch2=self.system_audio,
+                    device="cpu",
+                )
+            except Exception:
+                # 複合モードに未対応の場合は bc_2type をベースに初期化
+                self.maai_instance = Maai(
+                    mode="bc_2type",
+                    lang="jp",
+                    frame_rate=MAAI_FRAME_RATE,
+                    context_len_sec=MAAI_CONTEXT_LEN_SEC,
+                    audio_ch1=mic,
+                    audio_ch2=self.system_audio,
+                    device="cpu",
+                )
+            self.maai_instance.start()
+            print("[OK] [MaAI] 正常に初期化・起動しました。")
+        except ImportError:
+            print("[INFO] [MaAI] maaiパッケージ未検出。シミュレーション／待機モードで動作します。")
+            self.maai_instance = None
+        except Exception as e:
+            print(f"[WARN] [MaAI] 初期化スキップ ({e})。シミュレーションモードで継続します。")
+            self.maai_instance = None
+
+    def feed_system_audio(self, pcm_data: bytes, in_sample_rate: int = RECEIVE_SAMPLE_RATE):
+        """システム発話音声を2ch入力バッファに供給"""
+        self.system_audio.put_audio_pcm(pcm_data, in_sample_rate=in_sample_rate)
+
+    def clear_system_audio(self):
+        """システム音声バッファをクリア（無音状態へリセット）"""
+        self.system_audio.clear_buffer()
+
+    async def poll_loop(self):
+        """MaAIの推論結果を監視し、ステートマシンへ通知するループ"""
+        self.is_running = True
+        try:
+            while self.is_running:
+                if self.maai_instance:
+                    result = await asyncio.to_thread(self.maai_instance.get_result)
+                    if result:
+                        # P_shift 取得 (vap_mc の p_future / p_shift)
+                        p_shift = result.get("p_shift", result.get("p_future", 0.0))
+                        # P_bc 取得 (bc_2type の p_bc_react / p_bc_emo)
+                        p_react = result.get("p_bc_react", 0.0)
+                        p_emo = result.get("p_bc_emo", 0.0)
+                        p_bc = max(p_react, p_emo)
+                        category = "emotional" if p_emo > p_react else "reactive"
+
+                        self.state_machine.update_predictions(p_shift, p_bc, category)
+                else:
+                    # シミュレーション／アイドル待機
+                    await asyncio.sleep(MAAI_IDLE_SLEEP_SEC)
+
+                await asyncio.sleep(MAAI_POLL_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            pass
+
+
+# ==============================================================================
+# メイン対話ループ (AudioVideoLoop)
+# ==============================================================================
 
 class AudioVideoLoop:
     def __init__(self, video_mode=DEFAULT_MODE):
         self.video_mode = video_mode
 
         self.audio_in_queue = asyncio.Queue()
-        self.out_queue = asyncio.Queue(maxsize = 5) # Limit size to avoid excess memory use
+        self.out_queue = asyncio.Queue(maxsize=OUT_QUEUE_MAX_SIZE)  # メモリ使用量増加を防ぐためサイズ制限
 
         self.session = None
         self.audio_stream = None
+
+        # 相槌マネージャ
+        self.bc_manager = BackchannelManager()
+        # ステートマシン (P_shiftによるGemini投機的リクエスト & 相槌トリガー)
+        self.state_machine = DialogueStateMachine(
+            on_shift_callback=self.on_speculative_turn_shift,
+            on_bc_callback=self.on_backchannel_trigger,
+        )
+        # MaAI コントローラ
+        self.maai_controller = MaaiController(self.state_machine)
+
+    async def on_speculative_turn_shift(self):
+        """MaAIがP_shiftを検知した際にGeminiへ投機的トリガーを送信"""
+        if self.session:
+            try:
+                # ユーザー発話終了を投機的にGemini Live APIに伝達 (turn_complete)
+                await self.session.send_client_content(
+                    turns=types.Content(parts=[]),
+                    turn_complete=True,
+                )
+                print("[>>] [Gemini Live API] 投機的発話要求 (turn_complete) を送信しました")
+            except Exception as e:
+                print(f"[WARN] [Gemini Live API] 投機的送信エラー: {e}")
+
+    async def on_backchannel_trigger(self, category: str):
+        """MaAIがP_bcを検知した際の相槌再生（Gemini APIセッションは呼ばない）"""
+        await self.bc_manager.play_backchannel(
+            category=category,
+            on_audio_chunk=self.maai_controller.feed_system_audio,
+        )
 
     # --- Audio Handling ---
 
@@ -130,24 +596,24 @@ class AudioVideoLoop:
             input_device_index=mic_info["index"],
             frames_per_buffer=CHUNK_SIZE,
         )
-        if __debug__:
-            kwargs = {"exception_on_overflow": False}
-        else:
-            kwargs = {}
-        
+        kwargs = {"exception_on_overflow": False} if __debug__ else {}
+
         try:
             while True:
                 data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+
+                # ユーザーの入力音量 (RMS) を更新
+                self.bc_manager.update_user_rms(data)
+
                 payload = {
                     "data": data,
-                    "mime_type": "audio/pcm"
+                    "mime_type": "audio/pcm",
                 }
-                # To reduce latency instead of watiing to push in queue we pop oldest item in queue if its full
-                # This helps to keep the audio stream real time
+                # 遅延低減のため、キューがいっぱいの場合は最古のデータを破棄
                 try:
                     self.out_queue.put_nowait(payload)
                 except asyncio.QueueFull:
-                    _ = self.out_queue.get_nowait()  
+                    _ = self.out_queue.get_nowait()
                     self.out_queue.put_nowait(payload)
 
         except asyncio.CancelledError:
@@ -177,21 +643,24 @@ class AudioVideoLoop:
                 stream.close()
 
     async def receive_audio(self):
-        """Read from the websocket and write PCM chunks to the output queue."""
+        """WebsocketからGeminiの回答PCMを受信し、ステートマシンと同期"""
         try:
             while True:
                 turn = self.session.receive()
                 async for response in turn:
                     if data := response.data:
                         self.audio_in_queue.put_nowait(data)
+                        # MaAI 2ch（システム音声）へ供給
+                        self.maai_controller.feed_system_audio(data, in_sample_rate=RECEIVE_SAMPLE_RATE)
                         continue
                     if text := response.text:
-                        print(text, end="")
+                        print(text, end="", flush=True)
 
-                # If you interrupt the model, it sends a turn_complete.
-                # For interruptions to work, we need to stop playback.
-                # So empty out the audio queue because it may have loaded
-                # much more audio than has played yet.
+                # Geminiの回答完了（ターン終了）
+                self.state_machine.on_gemini_completed()
+                self.maai_controller.clear_system_audio()
+
+                # モデル発話を割り込んだ場合のキュークリア処理
                 while not self.audio_in_queue.empty():
                     self.audio_in_queue.get_nowait()
         except asyncio.CancelledError:
@@ -200,18 +669,13 @@ class AudioVideoLoop:
     # --- Video Handling ---
 
     def _capture_frame(self, cap):
-        """Capture frame from camera and convert to base64 JPEG."""
-        # Read the frame
+        """カメラからフレームをキャプチャしJPEG変換"""
         ret, frame = cap.read()
-        # Check if the frame was read successfully
         if not ret:
             return None
-        # Fix: Convert BGR to RGB color space
-        # OpenCV captures in BGR but PIL expects RGB format
-        # This prevents the blue tint in the video feed
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = PIL.Image.fromarray(frame_rgb)
-        img.thumbnail([1024, 1024])
+        img.thumbnail(IMAGE_MAX_SIZE)
 
         image_io = io.BytesIO()
         img.save(image_io, format="jpeg")
@@ -222,17 +686,13 @@ class AudioVideoLoop:
         return {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}
 
     async def capture_frames(self):
-        cap = await asyncio.to_thread(
-            cv2.VideoCapture, 0
-        )  # 0 represents the default camera
-
+        cap = await asyncio.to_thread(cv2.VideoCapture, 0)
         try:
             while True:
                 frame = await asyncio.to_thread(self._capture_frame, cap)
                 if frame is None:
                     break
-
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(VIDEO_FRAME_INTERVAL_SEC)
                 await self.out_queue.put(frame)
         except asyncio.CancelledError:
             pass
@@ -242,10 +702,9 @@ class AudioVideoLoop:
     def _capture_screen(self):
         sct = mss.mss()
         monitor = sct.monitors[0]
-        
         i = sct.grab(monitor)
-        
         img = PIL.Image.frombytes("RGB", i.size, i.rgb)
+        img.thumbnail(IMAGE_MAX_SIZE)
 
         image_io = io.BytesIO()
         img.save(image_io, format="jpeg")
@@ -261,8 +720,7 @@ class AudioVideoLoop:
                 frame = await asyncio.to_thread(self._capture_screen)
                 if frame is None:
                     break
-
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(VIDEO_FRAME_INTERVAL_SEC)
                 await self.out_queue.put(frame)
         except asyncio.CancelledError:
             pass
@@ -272,15 +730,12 @@ class AudioVideoLoop:
     async def send_text(self):
         try:
             while True:
-                text = await asyncio.to_thread(
-                    input,
-                    "message > ",
-                )
+                text = await asyncio.to_thread(input, "message > ")
                 if text.lower() == "q":
-                    print("👋 Exiting on user request...")
+                    print("[BYE] 終了リクエストを受信しました。")
                     break
                 await self.session.send_client_content(
-                    turns=types.Content(parts=[types.Part(text=text or "")]),
+                    turns=types.Content(parts=[types.Part.from_text(text=text or "")]),
                     turn_complete=True,
                 )
         except asyncio.CancelledError:
@@ -298,7 +753,11 @@ class AudioVideoLoop:
             pass
 
     async def run(self):
-        """Run all tasks to handle audio/video/text interaction"""
+        """全非同期タスクの統括実行"""
+        client = genai.Client(
+            api_key=os.environ.get("GEMINI_API_KEY"),
+            http_options={"api_version": "v1alpha"},
+        )
         try:
             async with (
                 client.aio.live.connect(model=MODEL, config=CONFIG) as session,
@@ -306,14 +765,13 @@ class AudioVideoLoop:
             ):
                 self.session = session
 
-                # Re-initialize queue for fresh session
                 self.audio_in_queue = asyncio.Queue()
-                self.out_queue = asyncio.Queue(maxsize=5)
+                self.out_queue = asyncio.Queue(maxsize=OUT_QUEUE_MAX_SIZE)
 
                 send_text_task = tg.create_task(self.send_text())
                 tg.create_task(self.send_realtime())
                 tg.create_task(self.listen_audio())
-                
+
                 if self.video_mode == "camera":
                     tg.create_task(self.capture_frames())
                 elif self.video_mode == "screen":
@@ -321,6 +779,9 @@ class AudioVideoLoop:
 
                 tg.create_task(self.receive_audio())
                 tg.create_task(self.play_audio())
+
+                # MaAIの判定ループを並行起動
+                tg.create_task(self.maai_controller.poll_loop())
 
                 await send_text_task
                 raise asyncio.CancelledError("User requested exit")
@@ -334,12 +795,12 @@ class AudioVideoLoop:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Ai - VAP + Gemini Live API Hybrid Agent")
     parser.add_argument(
         "--mode",
         type=str,
         default=DEFAULT_MODE,
-        help="pixels to stream from",
+        help="映像入力モード (camera, screen, none)",
         choices=["camera", "screen", "none"],
     )
     args = parser.parse_args()
