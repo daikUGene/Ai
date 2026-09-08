@@ -569,12 +569,9 @@ class AudioVideoLoop:
         """MaAIがP_shiftを検知した際にGeminiへ投機的トリガーを送信"""
         if self.session:
             try:
-                # ユーザー発話終了を投機的にGemini Live APIに伝達 (turn_complete)
-                await self.session.send_client_content(
-                    turns=types.Content(parts=[]),
-                    turn_complete=True,
-                )
-                print("[>>] [Gemini Live API] 投機的発話要求 (turn_complete) を送信しました")
+                # ユーザー発話終了をGemini Live APIに伝達
+                await self.session.send_realtime_input(audio_stream_end=True)
+                print("[>>] [Gemini Live API] 投機的発話要求を送信しました")
             except Exception as e:
                 print(f"[WARN] [Gemini Live API] 投機的送信エラー: {e}")
 
