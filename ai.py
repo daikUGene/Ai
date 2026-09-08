@@ -523,11 +523,11 @@ class MaaiController:
                 if self.maai_instance:
                     result = await asyncio.to_thread(self.maai_instance.get_result)
                     if result:
-                        # P_shift 取得 (vap_mc の p_future / p_shift)
-                        p_shift = result.get("p_shift", result.get("p_future", 0.0))
+                        # P_shift 取得 (vap_mc の p_now)
+                        p_shift = result["vap_mc"]["p_now"]
                         # P_bc 取得 (bc_2type の p_bc_react / p_bc_emo)
-                        p_react = result.get("p_bc_react", 0.0)
-                        p_emo = result.get("p_bc_emo", 0.0)
+                        p_react = result["bc_2type"]["p_bc_react"]
+                        p_emo = result["bc_2type"]["p_bc_emo"]
                         p_bc = max(p_react, p_emo)
                         category = "emotional" if p_emo > p_react else "reactive"
 
