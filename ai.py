@@ -106,8 +106,6 @@ MAAI_SAMPLE_RATE = 16000
 MAAI_FRAME_SIZE = 160
 MAAI_FRAME_RATE = 10
 MAAI_CONTEXT_LEN_SEC = 5
-MAAI_POLL_INTERVAL_SEC = 0.05
-MAAI_IDLE_SLEEP_SEC = 0.1
 SYSTEM_AUDIO_MAX_QUEUE_SIZE = 5
 SYSTEM_AUDIO_POLL_INTERVAL_SEC = 0.002
 
@@ -532,11 +530,6 @@ class MaaiController:
                         category = "emotional" if p_emo > p_react else "reactive"
 
                         self.state_machine.update_predictions(p_shift, p_bc, category)
-                else:
-                    # シミュレーション／アイドル待機
-                    await asyncio.sleep(MAAI_IDLE_SLEEP_SEC)
-
-                await asyncio.sleep(MAAI_POLL_INTERVAL_SEC)
         except asyncio.CancelledError:
             pass
 
