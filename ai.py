@@ -139,6 +139,10 @@ CONFIG = types.LiveConnectConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
         )
     ),
+    thinking_config=types.ThinkingConfig(
+        thinking_budget=0,
+        include_thoughts=False,
+    ),
     system_instruction=types.Content(
         parts=[types.Part.from_text(text=SYSTEM_INSTRUCTION)]
     ),
