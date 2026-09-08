@@ -36,6 +36,9 @@ import time
 import traceback
 import wave
 
+# Import MaaiMultiple and input base classes
+from maai import MaaiMultiple, MaaiInput
+
 import cv2
 import numpy as np
 import PIL.Image
@@ -325,42 +328,48 @@ class BackchannelManager:
 
 
 # ==============================================================================
-# MaAI 2ch システム音声入力 (SystemAudioInput)
+# MaAI 2ch 音声入力ソース (UserAudioInput & SystemAudioInput)
 # ==============================================================================
 
-try:
-    from maai.input import Base as MaaiInputBase
-except ImportError:
-    class MaaiInputBase:
-        FRAME_SIZE = MAAI_FRAME_SIZE
-        SAMPLING_RATE = MAAI_SAMPLE_RATE
+class UserAudioInput(MaaiInput.Base):
+    """
+    MaAI 2ch (Channel 1) 用のユーザー音声入力ソース。
+    PyAudioのlisten_audioストリームから読み込んだPCMデータ（16kHz, int16）を受け取り、
+    16kHz float32に変換してMaAIへ160サンプル（10ms）単位でリアルタイム供給する。
+    これにより、PyAudioのマイクオープンを1本に統一し、デバイス競合・音飛びを解消する。
+    """
+    def __init__(
+        self,
+        sample_rate: int = MAAI_SAMPLE_RATE,
+        frame_size: int = MAAI_FRAME_SIZE,
+    ):
+        super().__init__()
+        self.sampling_rate = sample_rate
+        self.frame_size = frame_size
+        self._audio_buffer = collections.deque()
+        self._buffer_lock = threading.Lock()
 
-        def __init__(self):
-            self._subscriber_queues = []
-            self._lock = threading.Lock()
-            self._is_thread_started = False
-            self.channels = 1
+    def put_audio_pcm(self, pcm_bytes: bytes):
+        if not pcm_bytes:
+            return
+        count = len(pcm_bytes) // BYTES_PER_SAMPLE_INT16
+        if count == 0:
+            return
+        floats = (np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / INT16_SCALE).tolist()
+        with self._buffer_lock:
+            self._audio_buffer.extend(floats)
+            while len(self._audio_buffer) >= self.frame_size:
+                frame = [self._audio_buffer.popleft() for _ in range(self.frame_size)]
+                self._put_to_all_queues(frame)
 
-        def subscribe(self):
-            q = queue.Queue()
-            with self._lock:
-                self._subscriber_queues.append(q)
-            return q
+    def start(self):
+        self._is_thread_started = True
 
-        def _put_to_all_queues(self, data):
-            with self._lock:
-                for q in self._subscriber_queues:
-                    q.put(data)
-
-        def get_audio_data(self, q=None):
-            return q.get()
-
-        def _get_queue_size(self):
-            with self._lock:
-                return sum(len(q.queue) for q in self._subscriber_queues)
+    def stop(self):
+        pass
 
 
-class SystemAudioInput(MaaiInputBase):
+class SystemAudioInput(MaaiInput.Base):
     """
     MaAI 2ch (Channel 2) 用のシステム音声入力ソース。
     AI発話中 (Gemini回答や相槌) はその音声をリサンプリング (16kHz float32) して供給し、
@@ -467,35 +476,24 @@ class MaaiController:
         self.maai_instance = None
         self.is_running = False
         self.system_audio = SystemAudioInput()
+        self.user_audio = UserAudioInput()
+
 
         self._init_maai()
 
     def _init_maai(self):
         try:
-            from maai import Maai, MaaiInput
-            # Ch1: Mic, Ch2: SystemAudioInput
-            mic = MaaiInput.Mic(mic_device_index=0)
-            try:
-                self.maai_instance = Maai(
-                    mode=["vap_mc", "bc_2type"],
-                    lang="jp",
-                    frame_rate=MAAI_FRAME_RATE,
-                    context_len_sec=MAAI_CONTEXT_LEN_SEC,
-                    audio_ch1=mic,
-                    audio_ch2=self.system_audio,
-                    device="cpu",
-                )
-            except Exception:
-                # 複合モードに未対応の場合は bc_2type をベースに初期化
-                self.maai_instance = Maai(
-                    mode="bc_2type",
-                    lang="jp",
-                    frame_rate=MAAI_FRAME_RATE,
-                    context_len_sec=MAAI_CONTEXT_LEN_SEC,
-                    audio_ch1=mic,
-                    audio_ch2=self.system_audio,
-                    device="cpu",
-                )
+            self.maai_instance = MaaiMultiple(
+                configs=[
+                    {"mode": "vap_mc", "lang": "jp"},
+                    {"mode": "bc_2type", "lang": "jp"},
+                ],
+                audio_ch1=self.user_audio,
+                audio_ch2=self.system_audio,
+                frame_rate=MAAI_FRAME_RATE,
+                context_len_sec=MAAI_CONTEXT_LEN_SEC,
+                device="cpu",
+            )
             self.maai_instance.start()
             print("[OK] [MaAI] 正常に初期化・起動しました。")
         except ImportError:
