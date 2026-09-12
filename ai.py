@@ -108,6 +108,8 @@ MAAI_FRAME_RATE = 10
 MAAI_CONTEXT_LEN_SEC = 5
 SYSTEM_AUDIO_MAX_QUEUE_SIZE = 5
 SYSTEM_AUDIO_POLL_INTERVAL_SEC = 0.002
+VAP_USER_SPEAKER_INDEX = 0
+VAP_SYSTEM_SPEAKER_INDEX = 1
 
 # --- 映像・キュー設定 ---
 OUT_QUEUE_MAX_SIZE = 5
@@ -181,11 +183,11 @@ class DialogueStateMachine:
         self.shift_debounce_count = 0
         self.bc_debounce_count = 0
 
-    def update_predictions(self, p_shift: float, p_bc: float, bc_category: str = "reactive"):
+    def update_predictions(self, p_system_turn: float, p_bc: float, bc_category: str = "reactive"):
         now = time.time()
 
         # デバウンスのカウント処理
-        if p_shift > THRESHOLD_P_SHIFT:
+        if p_system_turn > THRESHOLD_P_SHIFT:
             self.shift_debounce_count += 1
         else:
             self.shift_debounce_count = 0
@@ -195,11 +197,11 @@ class DialogueStateMachine:
         else:
             self.bc_debounce_count = 0
 
-        # 1. 優先度制御 (P_shift 優先)
+        # 1. 優先度制御 (p_system_turn 優先)
         if self.shift_debounce_count >= DEBOUNCE_FRAMES_SHIFT:
             self.shift_debounce_count = 0
             if self.state == DialogueState.STATE_LISTENING:
-                print(f"[!] [StateMachine] P_shift確定 ({p_shift:.2f}) -> STATE_PROCESSING_GEMINI に遷移")
+                print(f"[!] [StateMachine] p_system_turn確定 ({p_system_turn:.2f}) -> STATE_PROCESSING_GEMINI に遷移")
                 self.state = DialogueState.STATE_PROCESSING_GEMINI
                 # Geminiへの投機的発話要求
                 asyncio.create_task(self.on_shift_callback())
@@ -495,6 +497,7 @@ class MaaiController:
                 frame_rate=MAAI_FRAME_RATE,
                 context_len_sec=MAAI_CONTEXT_LEN_SEC,
                 device="cpu",
+                model_type="normal",
             )
             self.maai_instance.start()
             print("[OK] [MaAI] 正常に初期化・起動しました。")
@@ -521,15 +524,16 @@ class MaaiController:
                 if self.maai_instance:
                     result = await asyncio.to_thread(self.maai_instance.get_result)
                     if result:
-                        # P_shift 取得 (vap_mc の p_now)
-                        p_shift = result["vap_mc"]["p_now"]
+                        # p_now は [ユーザー, システム] の確率。
+                        p_system_turn = result["vap_mc"]["p_now"][VAP_SYSTEM_SPEAKER_INDEX]
+
                         # P_bc 取得 (bc_2type の p_bc_react / p_bc_emo)
                         p_react = result["bc_2type"]["p_bc_react"]
                         p_emo = result["bc_2type"]["p_bc_emo"]
                         p_bc = max(p_react, p_emo)
                         category = "emotional" if p_emo > p_react else "reactive"
 
-                        self.state_machine.update_predictions(p_shift, p_bc, category)
+                        self.state_machine.update_predictions(p_system_turn, p_bc, category)
         except asyncio.CancelledError:
             pass
 
@@ -547,6 +551,7 @@ class AudioVideoLoop:
 
         self.session = None
         self.audio_stream = None
+        self.session_send_lock = asyncio.Lock()
 
         # 相槌マネージャ
         self.bc_manager = BackchannelManager()
@@ -563,7 +568,8 @@ class AudioVideoLoop:
         if self.session:
             try:
                 # ユーザー発話終了をGemini Live APIに伝達
-                await self.session.send_realtime_input(audio_stream_end=True)
+                async with self.session_send_lock:
+                    await self.session.send_realtime_input(audio_stream_end=True)
                 print("[>>] [Gemini Live API] 投機的発話要求を送信しました")
             except Exception as e:
                 print(f"[WARN] [Gemini Live API] 投機的送信エラー: {e}")
@@ -596,6 +602,9 @@ class AudioVideoLoop:
 
                 # ユーザーの入力音量 (RMS) を更新
                 self.bc_manager.update_user_rms(data)
+
+                # MaAI 2ch（ユーザー音声）へ供給
+                self.maai_controller.user_audio.put_audio_pcm(data)
 
                 payload = {
                     "data": data,
@@ -639,7 +648,11 @@ class AudioVideoLoop:
         try:
             while True:
                 turn = self.session.receive()
+                interrupted = False
                 async for response in turn:
+                    server_content = getattr(response, "server_content", None)
+                    if server_content and getattr(server_content, "interrupted", False):
+                        interrupted = True
                     if data := response.data:
                         self.audio_in_queue.put_nowait(data)
                         # MaAI 2ch（システム音声）へ供給
@@ -652,9 +665,11 @@ class AudioVideoLoop:
                 self.state_machine.on_gemini_completed()
                 self.maai_controller.clear_system_audio()
 
-                # モデル発話を割り込んだ場合のキュークリア処理
-                while not self.audio_in_queue.empty():
-                    self.audio_in_queue.get_nowait()
+                # 正常終了した応答音声は再生キューに残す。
+                # 割り込み時だけ、既に生成済みの古い音声を破棄する。
+                if interrupted:
+                    while not self.audio_in_queue.empty():
+                        self.audio_in_queue.get_nowait()
         except asyncio.CancelledError:
             pass
 
@@ -737,10 +752,11 @@ class AudioVideoLoop:
         try:
             while True:
                 msg = await self.out_queue.get()
-                if msg["mime_type"].startswith("audio/"):
-                    await self.session.send_realtime_input(audio=msg)
-                else:
-                    await self.session.send_realtime_input(media=msg)
+                async with self.session_send_lock:
+                    if msg["mime_type"].startswith("audio/"):
+                        await self.session.send_realtime_input(audio=msg)
+                    else:
+                        await self.session.send_realtime_input(media=msg)
         except asyncio.CancelledError:
             pass
 
